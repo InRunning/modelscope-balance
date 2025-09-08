@@ -1,0 +1,162 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build modelscope-balance",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "build",
+                "-o",
+                "modelscope-balance",
+                "main.go"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "echo": true,
+                "focus": false,
+                "clear": false
+            },
+            "problemMatcher": "$go",
+            "detail": "编译Go程序"
+        },
+        {
+            "label": "Run modelscope-balance",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "run",
+                "main.go"
+            ],
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "echo": true,
+                "focus": false,
+                "clear": false
+            },
+            "problemMatcher": "$go",
+            "detail": "运行Go程序"
+        },
+        {
+            "label": "Test modelscope-balance",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "test",
+                "-v",
+                "./..."
+            ],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "echo": true,
+                "focus": false,
+                "clear": false
+            },
+            "problemMatcher": "$go",
+            "detail": "运行测试"
+        },
+        {
+            "label": "Tidy dependencies",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "mod",
+                "tidy"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "echo": true,
+                "focus": false,
+                "clear": false
+            },
+            "problemMatcher": "$go",
+            "detail": "整理依赖"
+        },
+        {
+            "label": "Format code",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "fmt",
+                "./..."
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "echo": true,
+                "focus": false,
+                "clear": false
+            },
+            "problemMatcher": "$go",
+            "detail": "格式化代码"
+        },
+        {
+            "label": "Vet code",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "vet",
+                "./..."
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "echo": true,
+                "focus": false,
+                "clear": false
+            },
+            "problemMatcher": "$go",
+            "detail": "检查代码"
+        },
+        {
+            "label": "Clean build",
+            "type": "shell",
+            "command": "rm",
+            "args": [
+                "-f",
+                "modelscope-balance"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "echo": true,
+                "focus": false,
+                "clear": false
+            },
+            "detail": "清理构建文件"
+        },
+        {
+            "label": "Build and Run",
+            "dependsOn": [
+                "Build modelscope-balance",
+                "Run modelscope-balance"
+            ],
+            "group": "build",
+            "detail": "构建并运行程序"
+        },
+        {
+            "label": "Full build cycle",
+            "dependsOn": [
+                "Tidy dependencies",
+                "Format code",
+                "Vet code",
+                "Build modelscope-balance"
+            ],
+            "group": "build",
+            "detail": "完整构建周期"
+        }
+    ]
+}

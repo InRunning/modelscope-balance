@@ -1,0 +1,11 @@
+{
+  "api_keys": [
+    "your_api_key_1_here",
+    "your_api_key_2_here",
+    "your_api_key_3_here"
+  ],
+  "server_port": "13842",
+  "target_url": "https://api-inference.modelscope.cn",
+  "health_check": true,
+  "health_path": "/v1/models"
+}
