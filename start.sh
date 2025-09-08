@@ -18,7 +18,7 @@ fi
 
 # 构建程序
 echo "正在构建程序..."
-go build -o modelscope-balance main.go
+go build -ldflags="-w -s" -o modelscope-balance main.go
 
 if [ $? -ne 0 ]; then
     echo "构建失败"
