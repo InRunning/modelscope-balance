@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -14,21 +17,21 @@ import (
 
 // Config 结构体用于存储配置信息
 type Config struct {
-	APIKeys      []string `json:"api_keys"`
-	ServerPort   string   `json:"server_port"`
-	TargetURL    string   `json:"target_url"`
-	HealthCheck  bool     `json:"health_check"`
-	HealthPath   string   `json:"health_path"`
+	APIKeys     []string `json:"api_keys"`
+	ServerPort  string   `json:"server_port"`
+	TargetURL   string   `json:"target_url"`
+	HealthCheck bool     `json:"health_check"`
+	HealthPath  string   `json:"health_path"`
 }
 
 // LoadBalancer 负载均衡器结构体
 type LoadBalancer struct {
-	config        *Config
-	currentIndex  int
-	mu            sync.Mutex
-	healthyKeys   map[string]bool
-	lastUsed      map[string]time.Time
-	rateLimit     map[string]int // 简单的请求计数
+	config       *Config
+	currentIndex int
+	mu           sync.Mutex
+	healthyKeys  map[string]bool
+	lastUsed     map[string]time.Time
+	rateLimit    map[string]int // 简单的请求计数
 }
 
 // NewLoadBalancer 创建新的负载均衡器
@@ -135,23 +138,80 @@ func LoadConfig(filename string) (*Config, error) {
 func createProxy(target *url.URL, apiKey string) *httputil.ReverseProxy {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 
+	// 配置Transport以处理HTTPS
+	proxy.Transport = &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: false, // 保持SSL验证
+		},
+	}
+
 	// 修改请求以添加认证头
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
+		// 保存原始请求体
+		var bodyBytes []byte
+		if req.Body != nil {
+			bodyBytes, _ = io.ReadAll(req.Body)
+			req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		}
+
 		originalDirector(req)
+
+		// 确保Host头正确设置为目标服务器
+		req.Host = target.Host
+		req.Header.Set("Host", target.Host)
+
+		// 魔搭API使用单个API Key
 		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("Content-Type", "application/json")
-		
-		// 记录请求信息
-		log.Printf("转发请求到: %s%s", req.Host, req.URL.Path)
+
+		// 恢复请求体
+		if bodyBytes != nil {
+			req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		}
+
+		// 记录请求信息 - 显示实际转发的目标URL
+		log.Printf("转发请求到: %s%s", target.Host, req.URL.Path)
+		log.Printf("使用API Key: %s...", apiKey[:10])
+		log.Printf("完整目标URL: %s", req.URL.String())
+
+		// 记录请求方法
+		log.Printf("请求方法: %s", req.Method)
+
+		// 记录请求头
+		log.Printf("请求头: %v", req.Header)
+
+		// 记录请求体（仅记录前100个字符）
+		if bodyBytes != nil {
+			bodyStr := string(bodyBytes)
+			if len(bodyStr) > 100 {
+				bodyStr = bodyStr[:100] + "..."
+			}
+			log.Printf("请求体: %s", bodyStr)
+		}
 	}
 
 	// 修改响应处理
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		log.Printf("收到响应状态码: %d", resp.StatusCode)
 		if resp.StatusCode >= 400 {
 			log.Printf("API返回错误状态码: %d", resp.StatusCode)
+			// 读取响应体以获取更多错误信息
+			if resp.Body != nil {
+				bodyBytes, err := io.ReadAll(resp.Body)
+				if err == nil {
+					log.Printf("错误响应体: %s", string(bodyBytes))
+					// 重新设置响应体
+					resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				}
+			}
 		}
 		return nil
+	}
+
+	// 添加错误处理
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("代理错误: %v", err)
+		http.Error(w, "代理转发失败: "+err.Error(), http.StatusBadGateway)
 	}
 
 	return proxy
@@ -167,22 +227,24 @@ func (lb *LoadBalancer) healthCheck() {
 		go func(apiKey string) {
 			client := &http.Client{Timeout: 10 * time.Second}
 			targetURL, _ := url.Parse(lb.config.TargetURL)
-			
-			req, err := http.NewRequest("GET", targetURL.String()+lb.config.HealthPath, nil)
+
+			// 正确构建健康检查URL
+			healthURL := targetURL.ResolveReference(&url.URL{Path: lb.config.HealthPath})
+			req, err := http.NewRequest("GET", healthURL.String(), nil)
 			if err != nil {
 				log.Printf("创建健康检查请求失败: %v", err)
 				return
 			}
-			
+
 			req.Header.Set("Authorization", "Bearer "+apiKey)
-			
+
 			resp, err := client.Do(req)
 			if err != nil || resp.StatusCode >= 500 {
 				lb.MarkAPIKeyUnhealthy(apiKey)
 			} else {
 				lb.MarkAPIKeyHealthy(apiKey)
 			}
-			
+
 			if resp != nil {
 				resp.Body.Close()
 			}
@@ -211,7 +273,7 @@ func main() {
 		go func() {
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
-			
+
 			for range ticker.C {
 				lb.healthCheck()
 			}
@@ -235,7 +297,7 @@ func main() {
 
 		// 创建代理
 		proxy := createProxy(targetURL, apiKey)
-		
+
 		// 处理请求
 		proxy.ServeHTTP(w, r)
 	})
@@ -256,7 +318,7 @@ func main() {
 				break
 			}
 		}
-		
+
 		if healthy {
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprintf(w, "Service is healthy")
@@ -270,7 +332,7 @@ func main() {
 	addr := ":" + config.ServerPort
 	log.Printf("启动负载均衡服务器，监听地址: %s", addr)
 	log.Printf("目标URL: %s", config.TargetURL)
-	
+
 	err = http.ListenAndServe(addr, nil)
 	if err != nil {
 		log.Fatalf("服务器启动失败: %v", err)

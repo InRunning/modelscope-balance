@@ -13,7 +13,7 @@ fi
 
 # 测试健康检查端点
 echo "1. 测试健康检查端点..."
-health_response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health)
+health_response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:13842/health)
 if [ "$health_response" -eq 200 ]; then
     echo "✅ 健康检查端点正常"
 else
@@ -22,18 +22,18 @@ fi
 
 # 测试统计信息端点
 echo "2. 测试统计信息端点..."
-stats_response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/stats)
+stats_response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:13842/stats)
 if [ "$stats_response" -eq 200 ]; then
     echo "✅ 统计信息端点正常"
     echo "统计信息:"
-    curl -s http://localhost:8080/stats | jq .
+    curl -s http://localhost:13842/stats | jq .
 else
     echo "❌ 统计信息端点异常，状态码: $stats_response"
 fi
 
 # 测试API转发（需要配置有效的API Key）
 echo "3. 测试API转发..."
-api_response=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/v1/chat/completions \
+api_response=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:13842/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-ai/DeepSeek-V3.1",
