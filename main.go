@@ -10,46 +10,45 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
 
-// Config 结构体用于存储配置信息
-type Config struct {
-	APIKeys     []string `json:"api_keys"`
-	ServerPort  string   `json:"server_port"`
-	TargetURL   string   `json:"target_url"`
-	HealthCheck bool     `json:"health_check"`
-	HealthPath  string   `json:"health_path"`
-}
-
 // LoadBalancer 负载均衡器结构体
 type LoadBalancer struct {
-	config       *Config
+	apiKeys      []string
 	currentIndex int
 	mu           sync.Mutex
 	healthyKeys  map[string]bool
-	lastUsed     map[string]time.Time
-	rateLimit    map[string]int // 简单的请求计数
+	failedUntil  map[string]time.Time // 记录API key失效直到何时
+	rateLimit    map[string]int       // 简单的请求计数
 }
 
 // NewLoadBalancer 创建新的负载均衡器
-func NewLoadBalancer(config *Config) *LoadBalancer {
-	lb := &LoadBalancer{
-		config:       config,
+func NewLoadBalancer() *LoadBalancer {
+	return &LoadBalancer{
 		currentIndex: 0,
 		healthyKeys:  make(map[string]bool),
-		lastUsed:     make(map[string]time.Time),
+		failedUntil:  make(map[string]time.Time),
 		rateLimit:    make(map[string]int),
 	}
+}
 
+// UpdateAPIKeys 更新API Keys列表
+func (lb *LoadBalancer) UpdateAPIKeys(keys []string) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	lb.apiKeys = keys
 	// 初始化所有API Key为健康状态
-	for _, key := range config.APIKeys {
-		lb.healthyKeys[key] = true
+	for _, key := range keys {
+		if _, exists := lb.healthyKeys[key]; !exists {
+			lb.healthyKeys[key] = true
+		}
 	}
-
-	return lb
 }
 
 // GetNextAPIKey 获取下一个可用的API Key
@@ -57,37 +56,47 @@ func (lb *LoadBalancer) GetNextAPIKey() (string, error) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
 
-	// 简单的负载均衡策略：轮询
-	for i := 0; i < len(lb.config.APIKeys); i++ {
-		key := lb.config.APIKeys[lb.currentIndex]
-		lb.currentIndex = (lb.currentIndex + 1) % len(lb.config.APIKeys)
+	if len(lb.apiKeys) == 0 {
+		return "", fmt.Errorf("没有可用的API Key")
+	}
 
-		// 检查API Key是否健康
+	// 收集所有可用的API Keys（健康且不在失效期内）
+	var availableKeys []string
+	for _, key := range lb.apiKeys {
 		if lb.healthyKeys[key] {
-			// 更新最后使用时间
-			lb.lastUsed[key] = time.Now()
-			lb.rateLimit[key]++
-			return key, nil
+			// 检查是否在失效期内
+			if failedUntil, exists := lb.failedUntil[key]; exists {
+				if time.Now().Before(failedUntil) {
+					continue // 跳过仍在失效期内的key
+				}
+				// 失效期已过，移除失效标记
+				delete(lb.failedUntil, key)
+			}
+			availableKeys = append(availableKeys, key)
 		}
 	}
 
-	return "", fmt.Errorf("没有可用的API Key")
+	if len(availableKeys) == 0 {
+		return "", fmt.Errorf("没有可用的API Key")
+	}
+
+	// 随机选择一个可用的API Key
+	selectedKey := availableKeys[rand.Intn(len(availableKeys))]
+	lb.rateLimit[selectedKey]++
+	return selectedKey, nil
 }
 
-// MarkAPIKeyUnhealthy 标记API Key为不健康
-func (lb *LoadBalancer) MarkAPIKeyUnhealthy(key string) {
+// MarkAPIKeyFailed 标记API Key为失效，失效时间为10秒
+func (lb *LoadBalancer) MarkAPIKeyFailed(key string) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
-	lb.healthyKeys[key] = false
-	log.Printf("API Key %s 已标记为不健康", key[:10]+"...")
-}
-
-// MarkAPIKeyHealthy 标记API Key为健康
-func (lb *LoadBalancer) MarkAPIKeyHealthy(key string) {
-	lb.mu.Lock()
-	defer lb.mu.Unlock()
-	lb.healthyKeys[key] = true
-	log.Printf("API Key %s 已标记为健康", key[:10]+"...")
+	lb.failedUntil[key] = time.Now().Add(10 * time.Second)
+	// 安全地显示API Key的前10个字符
+	if len(key) > 10 {
+		log.Printf("API Key %s... 已标记为失效，10秒后恢复", key[:10])
+	} else {
+		log.Printf("API Key %s 已标记为失效，10秒后恢复", key)
+	}
 }
 
 // GetStats 获取统计信息
@@ -96,46 +105,23 @@ func (lb *LoadBalancer) GetStats() map[string]interface{} {
 	defer lb.mu.Unlock()
 
 	stats := make(map[string]interface{})
-	for _, key := range lb.config.APIKeys {
+	for _, key := range lb.apiKeys {
 		keyShort := key[:10] + "..."
-		stats[keyShort] = map[string]interface{}{
-			"healthy":   lb.healthyKeys[key],
-			"last_used": lb.lastUsed[key],
-			"requests":  lb.rateLimit[key],
+		failedUntil, hasFailed := lb.failedUntil[key]
+		stat := map[string]interface{}{
+			"healthy":  lb.healthyKeys[key],
+			"requests": lb.rateLimit[key],
 		}
+		if hasFailed {
+			stat["failed_until"] = failedUntil
+		}
+		stats[keyShort] = stat
 	}
 	return stats
 }
 
-// LoadConfig 从文件加载配置
-func LoadConfig(filename string) (*Config, error) {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
-
-	var config Config
-	err = json.Unmarshal(data, &config)
-	if err != nil {
-		return nil, err
-	}
-
-	// 设置默认值
-	if config.ServerPort == "" {
-		config.ServerPort = "8080"
-	}
-	if config.TargetURL == "" {
-		config.TargetURL = "https://api-inference.modelscope.cn"
-	}
-	if config.HealthPath == "" {
-		config.HealthPath = "/v1/models"
-	}
-
-	return &config, nil
-}
-
 // createProxy 创建反向代理
-func createProxy(target *url.URL, apiKey string) *httputil.ReverseProxy {
+func createProxy(target *url.URL, apiKey string, lb *LoadBalancer) *httputil.ReverseProxy {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 
 	// 配置Transport以处理HTTPS
@@ -171,7 +157,12 @@ func createProxy(target *url.URL, apiKey string) *httputil.ReverseProxy {
 
 		// 记录请求信息 - 显示实际转发的目标URL
 		log.Printf("转发请求到: %s%s", target.Host, req.URL.Path)
-		log.Printf("使用API Key: %s...", apiKey[:10])
+		// 安全地显示API Key的前10个字符
+		if len(apiKey) > 10 {
+			log.Printf("使用API Key: %s...", apiKey[:10])
+		} else {
+			log.Printf("使用API Key: %s", apiKey)
+		}
 		log.Printf("完整目标URL: %s", req.URL.String())
 
 		// 记录请求方法
@@ -193,16 +184,28 @@ func createProxy(target *url.URL, apiKey string) *httputil.ReverseProxy {
 	// 修改响应处理
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		log.Printf("收到响应状态码: %d", resp.StatusCode)
-		if resp.StatusCode >= 400 {
+		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			// API Key无效或权限不足，标记为失效
+			// 安全地显示API Key的前10个字符
+			if len(apiKey) > 10 {
+				log.Printf("API Key %s... 无效，标记为失效", apiKey[:10])
+			} else {
+				log.Printf("API Key %s 无效，标记为失效", apiKey)
+			}
+			lb.MarkAPIKeyFailed(apiKey)
+		} else if resp.StatusCode >= 400 {
 			log.Printf("API返回错误状态码: %d", resp.StatusCode)
-			// 读取响应体以获取更多错误信息
-			if resp.Body != nil {
-				bodyBytes, err := io.ReadAll(resp.Body)
-				if err == nil {
+		}
+
+		// 读取响应体以获取更多错误信息
+		if resp.Body != nil {
+			bodyBytes, err := io.ReadAll(resp.Body)
+			if err == nil {
+				if resp.StatusCode >= 400 {
 					log.Printf("错误响应体: %s", string(bodyBytes))
-					// 重新设置响应体
-					resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 				}
+				// 重新设置响应体
+				resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			}
 		}
 		return nil
@@ -217,70 +220,59 @@ func createProxy(target *url.URL, apiKey string) *httputil.ReverseProxy {
 	return proxy
 }
 
-// healthCheck 健康检查函数
-func (lb *LoadBalancer) healthCheck() {
-	if !lb.config.HealthCheck {
-		return
+// parseAPIKeysFromHeader 从Authorization头解析API Keys
+func parseAPIKeysFromHeader(authHeader string) ([]string, error) {
+	if authHeader == "" {
+		return nil, fmt.Errorf("Authorization头为空")
 	}
 
-	for _, key := range lb.config.APIKeys {
-		go func(apiKey string) {
-			client := &http.Client{Timeout: 10 * time.Second}
-			targetURL, _ := url.Parse(lb.config.TargetURL)
-
-			// 正确构建健康检查URL
-			healthURL := targetURL.ResolveReference(&url.URL{Path: lb.config.HealthPath})
-			req, err := http.NewRequest("GET", healthURL.String(), nil)
-			if err != nil {
-				log.Printf("创建健康检查请求失败: %v", err)
-				return
-			}
-
-			req.Header.Set("Authorization", "Bearer "+apiKey)
-
-			resp, err := client.Do(req)
-			if err != nil || resp.StatusCode >= 500 {
-				lb.MarkAPIKeyUnhealthy(apiKey)
-			} else {
-				lb.MarkAPIKeyHealthy(apiKey)
-			}
-
-			if resp != nil {
-				resp.Body.Close()
-			}
-		}(key)
+	// 移除"Bearer "前缀（如果有）
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		authHeader = authHeader[7:]
 	}
+
+	// 按逗号分割API Keys
+	keys := strings.Split(authHeader, ",")
+
+	// 清理每个key的空格
+	var cleanKeys []string
+	for _, key := range keys {
+		cleanKey := strings.TrimSpace(key)
+		if cleanKey != "" {
+			cleanKeys = append(cleanKeys, cleanKey)
+		}
+	}
+
+	if len(cleanKeys) == 0 {
+		return nil, fmt.Errorf("没有找到有效的API Keys")
+	}
+
+	return cleanKeys, nil
 }
 
 func main() {
-	// 加载配置
-	config, err := LoadConfig("config.json")
+	// 读取配置文件
+	configFile, err := os.ReadFile("config.json")
 	if err != nil {
-		log.Fatalf("加载配置失败: %v", err)
+		log.Fatalf("读取配置文件失败: %v", err)
 	}
 
-	if len(config.APIKeys) == 0 {
-		log.Fatal("配置中没有找到API Keys")
+	var config struct {
+		ServerPort string `json:"server_port"`
+		TargetURL  string `json:"target_url"`
+		HealthCheck bool `json:"health_check"`
+		HealthPath string `json:"health_path"`
 	}
-
-	log.Printf("加载了 %d 个API Keys", len(config.APIKeys))
+	
+	err = json.Unmarshal(configFile, &config)
+	if err != nil {
+		log.Fatalf("解析配置文件失败: %v", err)
+	}
 
 	// 创建负载均衡器
-	lb := NewLoadBalancer(config)
+	lb := NewLoadBalancer()
 
-	// 启动健康检查
-	if config.HealthCheck {
-		go func() {
-			ticker := time.NewTicker(30 * time.Second)
-			defer ticker.Stop()
-
-			for range ticker.C {
-				lb.healthCheck()
-			}
-		}()
-	}
-
-	// 解析目标URL
+	// 从配置文件读取目标URL
 	targetURL, err := url.Parse(config.TargetURL)
 	if err != nil {
 		log.Fatalf("解析目标URL失败: %v", err)
@@ -288,6 +280,17 @@ func main() {
 
 	// 创建HTTP处理器
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// 从Authorization头获取API Keys
+		authHeader := r.Header.Get("Authorization")
+		apiKeys, err := parseAPIKeysFromHeader(authHeader)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("解析API Keys失败: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		// 更新负载均衡器的API Keys
+		lb.UpdateAPIKeys(apiKeys)
+
 		// 获取下一个API Key
 		apiKey, err := lb.GetNextAPIKey()
 		if err != nil {
@@ -296,7 +299,7 @@ func main() {
 		}
 
 		// 创建代理
-		proxy := createProxy(targetURL, apiKey)
+		proxy := createProxy(targetURL, apiKey, lb)
 
 		// 处理请求
 		proxy.ServeHTTP(w, r)
@@ -311,15 +314,20 @@ func main() {
 
 	// 添加健康检查端点
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		healthy := false
-		for _, isHealthy := range lb.healthyKeys {
-			if isHealthy {
-				healthy = true
-				break
+		hasAvailableKeys := false
+		lb.mu.Lock()
+		for _, key := range lb.apiKeys {
+			if lb.healthyKeys[key] {
+				// 检查是否在失效期内
+				if failedUntil, exists := lb.failedUntil[key]; !exists || time.Now().After(failedUntil) {
+					hasAvailableKeys = true
+					break
+				}
 			}
 		}
+		lb.mu.Unlock()
 
-		if healthy {
+		if hasAvailableKeys {
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprintf(w, "Service is healthy")
 		} else {
@@ -330,8 +338,11 @@ func main() {
 
 	// 启动服务器
 	addr := ":" + config.ServerPort
-	log.Printf("启动负载均衡服务器，监听地址: %s", addr)
-	log.Printf("目标URL: %s", config.TargetURL)
+	log.Printf("启动无状态代理服务器，监听地址: %s", addr)
+	log.Printf("目标URL: %s", targetURL.String())
+	log.Printf("健康检查: %v", config.HealthCheck)
+	log.Printf("健康检查路径: %s", config.HealthPath)
+	log.Printf("请使用Authorization头传递API Keys，格式：Bearer key1,key2,key3...")
 
 	err = http.ListenAndServe(addr, nil)
 	if err != nil {
