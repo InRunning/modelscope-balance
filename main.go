@@ -197,16 +197,17 @@ func createProxy(target *url.URL, apiKey string, lb *LoadBalancer) *httputil.Rev
 			log.Printf("API返回错误状态码: %d", resp.StatusCode)
 		}
 
-		// 读取响应体以获取更多错误信息
-		if resp.Body != nil {
-			bodyBytes, err := io.ReadAll(resp.Body)
+		// 只在错误情况下读取响应体用于日志记录，保持流式响应
+		if resp.StatusCode >= 400 && resp.Body != nil {
+			// 使用io.TeeReader来读取响应体同时保持原始流
+			var buf bytes.Buffer
+			teeReader := io.TeeReader(resp.Body, &buf)
+			bodyBytes, err := io.ReadAll(teeReader)
 			if err == nil {
-				if resp.StatusCode >= 400 {
-					log.Printf("错误响应体: %s", string(bodyBytes))
-				}
-				// 重新设置响应体
-				resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				log.Printf("错误响应体: %s", string(bodyBytes))
 			}
+			// 重新设置响应体，确保数据可以继续流式传输
+			resp.Body = io.NopCloser(io.MultiReader(&buf, resp.Body))
 		}
 		return nil
 	}
