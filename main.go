@@ -237,9 +237,15 @@ func createProxy(target *url.URL, apiKey string, lb *LoadBalancer) http.Handler 
 			return
 		}
 
-		// 对于成功的响应，直接流式传输响应体
-		// 使用io.Copy实现实时流式传输
-		_, err = io.Copy(w, resp.Body)
+		// 对于成功的响应，启用流式传输
+		// 确保响应是流式的，不缓冲
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+
+		// 使用io.Copy实现实时流式传输，设置缓冲区大小以提高性能
+		buf := make([]byte, 32*1024) // 32KB缓冲区
+		_, err = io.CopyBuffer(w, resp.Body, buf)
 		if err != nil {
 			log.Printf("流式传输响应体失败: %v", err)
 		}

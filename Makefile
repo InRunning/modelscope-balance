@@ -36,7 +36,8 @@ deps:
 # 部署程序（停止旧进程，重新构建并启动）
 deploy:
 	@echo "停止旧进程..."
-	@pkill -f "modelscope-balance" || true
+	@ps aux | grep "modelscope-balance" | grep -v grep | awk '{print $$2}' | xargs -r kill -9 || true
+	@sleep 1
 	@echo "重新构建程序..."
 	@make build
 	@echo "启动新进程..."
