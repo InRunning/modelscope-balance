@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
@@ -237,17 +238,62 @@ func createProxy(target *url.URL, apiKey string, lb *LoadBalancer) http.Handler 
 			return
 		}
 
+		// 检查是否为JSON响应
+		contentType := resp.Header.Get("Content-Type")
+		isJSON := strings.Contains(contentType, "application/json")
+		
 		// 对于成功的响应，启用流式传输
 		// 确保响应是流式的，不缓冲
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
 
-		// 使用io.Copy实现实时流式传输，设置缓冲区大小以提高性能
-		buf := make([]byte, 32*1024) // 32KB缓冲区
-		_, err = io.CopyBuffer(w, resp.Body, buf)
-		if err != nil {
-			log.Printf("流式传输响应体失败: %v", err)
+		if isJSON {
+			// 对于JSON响应，使用更安全的流式处理方式
+			// 确保JSON对象完整性
+			scanner := bufio.NewScanner(resp.Body)
+			buffer := bytes.NewBuffer(nil)
+			inJSON := false
+			braceCount := 0
+			
+			for scanner.Scan() {
+				line := scanner.Text()
+				for _, char := range line {
+					buffer.WriteRune(char)
+					switch char {
+					case '{':
+						braceCount++
+						inJSON = true
+					case '}':
+						braceCount--
+						if braceCount == 0 && inJSON {
+							// 完整的JSON对象，写入并刷新
+							w.Write(buffer.Bytes())
+							if flusher, ok := w.(http.Flusher); ok {
+								flusher.Flush()
+							}
+							buffer.Reset()
+							inJSON = false
+						}
+					}
+				}
+			}
+			
+			if err := scanner.Err(); err != nil {
+				log.Printf("扫描JSON响应失败: %v", err)
+			}
+			
+			// 写入剩余的数据
+			if buffer.Len() > 0 {
+				w.Write(buffer.Bytes())
+			}
+		} else {
+			// 对于非JSON响应，使用标准的流式传输
+			buf := make([]byte, 32*1024) // 32KB缓冲区
+			_, err = io.CopyBuffer(w, resp.Body, buf)
+			if err != nil {
+				log.Printf("流式传输响应体失败: %v", err)
+			}
 		}
 	})
 }
