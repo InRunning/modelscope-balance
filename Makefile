@@ -1,4 +1,4 @@
-.PHONY: build run clean test help
+.PHONY: build run clean test help deploy
 
 # 默认目标
 all: build
@@ -26,8 +26,19 @@ help:
 	@echo "  run       - 运行程序"
 	@echo "  clean     - 清理构建文件"
 	@echo "  test      - 运行测试"
+	@echo "  deploy    - 部署程序（停止旧进程，重新构建并启动）"
 	@echo "  help      - 显示此帮助信息"
 
 # 安装依赖
 deps:
 	go mod tidy
+
+# 部署程序（停止旧进程，重新构建并启动）
+deploy:
+	@echo "停止旧进程..."
+	@pkill -f "modelscope-balance" || true
+	@echo "重新构建程序..."
+	@make build
+	@echo "启动新进程..."
+	@nohup ./modelscope-balance > /home/ubuntu/nohup.out 2>&1 &
+	@echo "部署完成，进程已在后台运行"

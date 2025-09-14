@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"math/rand"
 	"os"
@@ -120,56 +119,38 @@ func (lb *LoadBalancer) GetStats() map[string]interface{} {
 	return stats
 }
 
-// createProxy 创建反向代理
-func createProxy(target *url.URL, apiKey string, lb *LoadBalancer) *httputil.ReverseProxy {
-	proxy := httputil.NewSingleHostReverseProxy(target)
-
-	// 配置Transport以处理HTTPS
-	proxy.Transport = &http.Transport{
+// createProxy 创建反向代理 - 支持真正的流式传输
+func createProxy(target *url.URL, apiKey string, lb *LoadBalancer) http.Handler {
+	// 创建自定义的Transport以处理HTTPS
+	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: false, // 保持SSL验证
 		},
 	}
 
-	// 修改请求以添加认证头
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 保存原始请求体
 		var bodyBytes []byte
-		if req.Body != nil {
-			bodyBytes, _ = io.ReadAll(req.Body)
-			req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-		}
-
-		originalDirector(req)
-
-		// 确保Host头正确设置为目标服务器
-		req.Host = target.Host
-		req.Header.Set("Host", target.Host)
-
-		// 魔搭API使用单个API Key
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-
-		// 恢复请求体
-		if bodyBytes != nil {
-			req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		if r.Body != nil {
+			bodyBytes, _ = io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		}
 
 		// 记录请求信息 - 显示实际转发的目标URL
-		log.Printf("转发请求到: %s%s", target.Host, req.URL.Path)
+		log.Printf("转发请求到: %s%s", target.Host, r.URL.Path)
 		// 安全地显示API Key的前10个字符
 		if len(apiKey) > 10 {
 			log.Printf("使用API Key: %s...", apiKey[:10])
 		} else {
 			log.Printf("使用API Key: %s", apiKey)
 		}
-		log.Printf("完整目标URL: %s", req.URL.String())
+		log.Printf("完整目标URL: %s", r.URL.String())
 
 		// 记录请求方法
-		log.Printf("请求方法: %s", req.Method)
+		log.Printf("请求方法: %s", r.Method)
 
 		// 记录请求头
-		log.Printf("请求头: %v", req.Header)
+		log.Printf("请求头: %v", r.Header)
 
 		// 记录请求体（仅记录前100个字符）
 		if bodyBytes != nil {
@@ -179,14 +160,51 @@ func createProxy(target *url.URL, apiKey string, lb *LoadBalancer) *httputil.Rev
 			}
 			log.Printf("请求体: %s", bodyStr)
 		}
-	}
 
-	// 修改响应处理
-	proxy.ModifyResponse = func(resp *http.Response) error {
+		// 创建新的请求URL
+		targetURL := &url.URL{
+			Scheme:   target.Scheme,
+			Host:     target.Host,
+			Path:     r.URL.Path,
+			RawQuery: r.URL.RawQuery,
+		}
+
+		// 创建新的请求
+		req, err := http.NewRequest(r.Method, targetURL.String(), bytes.NewBuffer(bodyBytes))
+		if err != nil {
+			log.Printf("创建请求失败: %v", err)
+			http.Error(w, "创建请求失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// 复制请求头
+		for key, values := range r.Header {
+			for _, value := range values {
+				req.Header.Add(key, value)
+			}
+		}
+
+		// 设置Host头
+		req.Host = target.Host
+		req.Header.Set("Host", target.Host)
+
+		// 设置Authorization头
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+
+		// 发送请求
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			log.Printf("请求失败: %v", err)
+			http.Error(w, "请求失败: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
 		log.Printf("收到响应状态码: %d", resp.StatusCode)
+		
+		// 处理API Key失效情况
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
 			// API Key无效或权限不足，标记为失效
-			// 安全地显示API Key的前10个字符
 			if len(apiKey) > 10 {
 				log.Printf("API Key %s... 无效，标记为失效", apiKey[:10])
 			} else {
@@ -197,28 +215,35 @@ func createProxy(target *url.URL, apiKey string, lb *LoadBalancer) *httputil.Rev
 			log.Printf("API返回错误状态码: %d", resp.StatusCode)
 		}
 
-		// 只在错误情况下读取响应体用于日志记录，保持流式响应
-		if resp.StatusCode >= 400 && resp.Body != nil {
-			// 使用io.TeeReader来读取响应体同时保持原始流
-			var buf bytes.Buffer
-			teeReader := io.TeeReader(resp.Body, &buf)
-			bodyBytes, err := io.ReadAll(teeReader)
+		// 复制响应头
+		for key, values := range resp.Header {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+
+		// 设置状态码
+		w.WriteHeader(resp.StatusCode)
+
+		// 对于错误响应，读取完整响应体用于日志记录
+		if resp.StatusCode >= 400 {
+			bodyBytes, err := io.ReadAll(resp.Body)
 			if err == nil {
 				log.Printf("错误响应体: %s", string(bodyBytes))
+				w.Write(bodyBytes)
+			} else {
+				log.Printf("读取错误响应体失败: %v", err)
 			}
-			// 重新设置响应体，确保数据可以继续流式传输
-			resp.Body = io.NopCloser(io.MultiReader(&buf, resp.Body))
+			return
 		}
-		return nil
-	}
 
-	// 添加错误处理
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("代理错误: %v", err)
-		http.Error(w, "代理转发失败: "+err.Error(), http.StatusBadGateway)
-	}
-
-	return proxy
+		// 对于成功的响应，直接流式传输响应体
+		// 使用io.Copy实现实时流式传输
+		_, err = io.Copy(w, resp.Body)
+		if err != nil {
+			log.Printf("流式传输响应体失败: %v", err)
+		}
+	})
 }
 
 // parseAPIKeysFromHeader 从Authorization头解析API Keys
